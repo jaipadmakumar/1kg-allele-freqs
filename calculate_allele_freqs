@@ -1,0 +1,323 @@
+#!/usr/bin/python2.7
+
+import subprocess
+import csv
+import os
+import shutil
+
+full_chr_vcf = 'ALL.chr21.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.vcf.gz'
+coding_sequence_fasta = 'MxA_Coding.fasta'
+transcript_sequence_fasta = 'MxA_Transcript.fasta'
+exon_list_csv = 'v76_ExonsSpreadsheet-Homo_sapiens-Transcript-Exons-81-ENST00000398600.csv'
+chr_num = '21'
+gene_name = 'MxA'
+
+'''Script is used to find the allele frequencies of SNPs in the coding sequence of a gene
+given a vcf file from 1000genomes containing all the chromosomal SNPs. It requires a csv file containing 
+the locations of the introns/exons in the format Ensembl outputs. It also requires separate 
+files containing the coding and transcript sequences in fasta format. A gene name must be
+given (used in naming files) and the chromosome number should be explicitly given. 
+
+full_chr_vcf = path to gunzipped vcf file (extension .vcf.gz) containing at a minimum all 
+				SNPs in the gene. Usually this will be the full chromosomal vcf file from 
+				1kg project.
+coding_sequence_fasta = path to fasta file of coding sequence
+transcript_sequence_fasta = path to fasta file of transcript sequence
+exon_list_csv = csv file of introns and exons from Ensembl
+chr_num = chromosome number of whatever your working with as a string
+gene_name = name of gene for file outputs 
+''' 
+
+def rename_file(file, new_file_name, quiet=True):
+	subprocess.call(['mv', file, new_file_name])
+	if quiet==False: print "Renamed '%s' to --> '%s' " % (file, new_file_name)
+	return
+
+def extract_region(input):
+	'''Extracts region from input vcf file (input vcf file should be gz compressed)
+	using from_bp and to_bp, both of which are chromosomal locations
+	Writes extracted region to new vcf file in working directory
+	Unless rename_output is called, output file will be named 'out.recode.vcf' by default
+	'''
+	print "Extracting a smaller region of vcf file b/c I'm lazy and it's faster this way."
+	command = ['vcftools', '--gzvcf', input, '--chr', chr_num, '--from-bp', start_bp,
+					'--to-bp', end_bp, '--recode', '--recode-INFO-all']
+	subprocess.call(command)
+	
+	rename_file('out.recode.vcf', gene_name + '-pre_mRNA.vcf')
+	return 
+	
+
+
+def get_EnsemblExons(input):
+	'''Takes exons spreadsheet downloadable from Ensembl (click exons for transcript, export to spreadsheet by clicking
+		the spreadsheet icon in top right of exon table) as input
+		Returns a list of 2-item tuples indicating exon positions
+		First item in tuple is exon start position and 2nd item is exon end position
+		Positions are stored as integers'''
+		
+	csv_file = csv.reader(open(input))
+	exons = []
+	for r in csv_file:
+		if r[0].isdigit() is True:
+			exons.append((int(r[2].replace(',', '')),int(r[3].replace(',', ''))))
+			# subtract 1 from both values in order to 0 index exon positions
+	return exons
+
+def get_EnsemblIntrons(input):
+	csv_file = csv.reader(open(input))
+	introns = []
+	for r in csv_file:
+		if r[1].startswith('I'):
+			introns.append((int(r[2].replace(',', '')),int(r[3].replace(',', ''))))
+	return introns	
+
+
+
+
+def build_transcript_vcf(input):
+	'''Takes a list of 2-item tuples containing exon start and end positions, 'exon_list'
+		'exon_list' is the output of 'get_EnsemblExons()' 
+		Takes input vcf file (usually a vcf file containing gene of interest, output of 
+		'extract_region()') and builds a vcf file corresponding to the transcript using the 
+		exon positions in 'exon_list' 
+		Writes file with same name as input with 'Transcript' prefix '''
+		
+	print 'Building transcript...'
+	cwd = os.getcwd()
+	path2input = cwd + '/' + input
+	os.mkdir('TEMP')
+	os.chdir(cwd + '/TEMP')
+	
+	c = 1
+	exon_files = []
+	for exon in exon_list:
+		command = ['vcftools', '--vcf', path2input, '--chr', chr_num,
+				 '--from-bp', str(exon[0]),
+				 '--to-bp', str(exon[1]),
+				 '--out', 'temp', '--recode', '--recode-INFO-all']
+		print command
+		subprocess.call(command)
+		exon_outfile_name = 'temp' + str(c) + '.recode.vcf'
+		exon_files.append(exon_outfile_name)
+		rename_file('temp.recode.vcf', exon_outfile_name)
+		rename_file('temp.log', 'temp' + str(c) + '.log')
+		c+=1
+		
+	exon_names = ' '.join(exon_files)
+	concat_outfile = 'Transcript-' + gene_name + '.vcf'
+	concat_com = 'vcf-concat ' + exon_names + '> ' + concat_outfile
+	subprocess.call(concat_com, shell=True)
+	
+	shutil.move(concat_outfile, '../')
+	os.chdir('../')
+	shutil.rmtree(os.getcwd() + '/TEMP')
+	
+	print '\nCreated transcript file: %s' % concat_outfile
+		
+		
+def get_Allele_Frequencies(input):
+	command = ['vcftools', '--vcf', input, '--freq',
+				 '--out',gene_name + '-allele_freqs']
+	subprocess.call(command)
+	return
+
+
+
+
+#########################################################################################
+# Rest of functions are for mapping chromosomal coordinates in allele frequency file 
+# of transcript (mRNA).
+#########################################################################################
+
+
+def ReadFASTA(fastafile):
+    """Reads sequences from a FASTA file. Written by Jesse Bloom
+
+    CALLING VARIABLE:
+
+    `fastafile` : specify the name of a FASTA file.
+
+    RETURN VARIABLE: 
+    
+    This function reads all sequences from the FASTA file.  It returns the
+    list `headers_seqs`.  This list is composed of a 2-tuple `(header, seq)`
+    for every sequence entry in `fastafile`. `header` is the header for
+    a sequence, with the leading ">" and any trailing spaces removed. `seq`
+    is the corresponding sequence.
+    """
+    lines = open(fastafile).readlines()
+    headers_seqs = []
+    header = None
+    seq = []
+    for line in lines:
+        if line[0] == '>':
+            if (not header) and (not seq):
+                pass # first sequence in file
+            elif header and not seq:
+                raise ValueError, "Empty sequence for %s" % header
+            elif seq and not header:
+                raise ValueError, "File does not begin with header."
+            else:
+                seq = ''.join(seq)
+                seq = seq.replace(' ', '')
+                headers_seqs.append((header, seq))
+            header = line.strip()[1 : ]
+            seq = []
+        else:
+            seq.append(line.strip())
+    if (not header) and (not seq):
+        pass # first sequence in file
+    elif header and not seq:
+        raise ValueError, "Empty sequence for %s" % header
+    elif seq and not header:
+        raise ValueError, "File does not begin with header."
+    else:
+        seq = ''.join(seq)
+        seq = seq.replace(' ', '')
+        headers_seqs.append((header, seq))
+    return headers_seqs
+    
+
+
+
+def sum_introns(intron_list):
+	'''Returns 'intron_sums' list. 'intron_sums' is a list where each element is the sum of 
+	the introns upstream of given exon. Number of elements in this list is equal to the
+	number of exons. For example,
+	sum of introns upstream of 1st exon = intron_sum[0] = 0
+	sum of introns upstream of 2nd exon = intron_sum[1] = length of 1st intron
+	sum of introns upstream of 3rd exon = intron_sum[2] = length of 1st intron + length 2nd intron
+	and so on...'''
+	intron_sums = []
+	sum = 0
+	for t in intron_list:
+		intron_length = t[1] - t[0] + 1 
+		i = intron_length + sum
+		intron_sums.append(i)
+		sum += intron_length
+	return [0] + intron_sums
+
+
+def map_chr_to_transcript_positions(chr_positions, exon_list, intron_sums):
+	'''Maps chromosomal coordinates to positions in transcript. Takes as arguments:
+	'chr_positions' = list of integer chromosomal positions
+	'exon_list'     = output from get_EnsemblExons()
+	'intron_sums'   = output from sum_introns()
+	Returns 'trans_chr_map' which is a list of two-item tuples with structure
+	(positions in transcript, corresponding position in chromosome). Note that 1 is
+	subtracted from each element to 0 index the values'''
+	
+	map = []
+	tss = exon_list[0][0]
+	enu_exons = [(ex_num, ex) for ex_num, ex in enumerate(exon_list)] 
+	enu_introns = [(intron_num,intron_sum) for intron_num,intron_sum in enumerate(intron_sums)]
+	for chr in chr_positions:
+		for exon_index,exon in enu_exons:
+			if exon[0] <= chr <= exon[1]: #find which exon the value is in, if in 1st exon returns 0 
+				break
+		transcript_position = chr - tss - intron_sums[exon_index] 
+		map.append((transcript_position - 1, chr - 1))		# -1 in order to 0 index positions
+	trans_chr_map = map
+	return trans_chr_map
+	
+
+def get_Coding_Start_Index(coding_fasta, transcript_fasta):
+	'''Returns 'coding_positions_data' tuple which is a 2-item tuple containing the coding 
+	start index relative to the transcript. 
+	and the number of nt's between the end of the coding sequence and the end of the
+	transcript.
+	'coding_fasta' and 'transcript_fasta' are the coding sequence and transcript sequence
+	fasta files, respectively.'''
+	
+	coding_f = ReadFASTA(coding_fasta)
+	transcript_f = ReadFASTA(transcript_fasta)
+	coding_seq, transcript_seq = coding_f[0][1], transcript_f[0][1]
+	
+	coding_start = transcript_seq.find(coding_seq) #start index of coding sequence in transcript
+	#print 'Coding start =' , coding_start
+	coding_end = coding_start + len(coding_seq) - 1 # -1 b/c adding full length overshoots end
+	coding_position_data = (coding_start,len(coding_seq))
+	return coding_position_data
+
+def map_transcript_to_coding_positions(trans_chr_map, coding_position_data):
+	'''Returns 'coding_chr_map' which is a list of two-item tuples similar to 'trans_chr_map'
+	except the transcript positions have been replaced with coding positions'''
+	cs,l = coding_position_data #coding start, length
+	coding_chr_map = []
+	for t in trans_chr_map:
+		i = t[0] - cs
+	
+		if 0 <= i <= l: #coding position must be >0 and before the coding end
+			coding_chr_map.append((i,t[1]))
+	return coding_chr_map
+
+
+
+
+
+def run_everything(allele_frq_file):
+	exon_list   = get_EnsemblExons(exon_list_csv)
+	intron_list = get_EnsemblIntrons(exon_list_csv)
+	intron_sums = sum_introns(intron_list)
+	coding_data = get_Coding_Start_Index(coding_sequence_fasta, transcript_sequence_fasta)
+	
+	f = [line for line in open(allele_frq_file, 'r').readlines()]
+	out = 'Coding_Position_Mapped_SNPS.frq'
+	header = f[0]
+		
+	
+	new_lines = []
+	chr_positions = []
+	
+		
+		
+	#file object is a generator so readline() up there increments you passed the header already
+	#thats why below is just readlines() not readlines()[1:]
+	for line in f[1:]:
+		split_line = line.split()
+		chr_position = int(split_line[1])
+		chr_positions.append(chr_position)
+	
+	trans_chr_map = map_chr_to_transcript_positions(chr_positions, exon_list, intron_sums)
+	chr_map = map_transcript_to_coding_positions(trans_chr_map, coding_data) #coding2chr map
+	map_dict = {chr:coding for coding,chr in chr_map}
+
+	for line in f[1:]:
+		split_line = line.split()
+		chr_position = int(split_line[1])
+		if chr_position - 1 in map_dict:
+			coding_position = map_dict[chr_position - 1] + 1 # adding 1 b/c otherwise would be 0 indexed
+			
+			#write file out
+			split_line[1] = str(coding_position)
+			split_line[-1] += '\n'
+			new_line = '\t'.join(split_line)
+			new_lines.append(new_line)
+
+	
+	with open(out, 'w') as out:
+		out.write(header)
+		c = 1
+		for l in new_lines:
+			out.write(l)
+			c+=1
+	
+	print 'wrote file!'
+	print 'kept %i of %i sites' % (c, len(f))
+	
+	
+	
+	return 
+	
+
+exon_list = get_EnsemblExons(exon_list_csv)
+start_bp = str(exon_list[0][0])
+end_bp = str(exon_list[-1][-1])
+intron_list = get_EnsemblIntrons(exon_list_csv)
+
+
+extract_region(full_chr_vcf)
+build_transcript_vcf(gene_name + '-pre_mRNA.vcf')
+get_Allele_Frequencies('Transcript-' + gene_name + '.vcf')
+run_everything(gene_name + '-allele_freqs.frq')
